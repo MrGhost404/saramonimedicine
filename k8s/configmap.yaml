@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arogyapos-config
+  labels:
+    app: arogyapos
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  DATA_DIR: "/app/data"

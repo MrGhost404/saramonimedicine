@@ -1,0 +1,8 @@
+{
+  "name": "সারা মনি মেডিসিন কর্নার ",
+  "description": "অফলাইন-ফার্স্ট, রিয়েল-টাইম এবং এন্ড-টু-এন্ড এনক্রিপ্টেড বাংলা ফার্মেসি ইনভেন্টরি, POS বিলিং ও কাস্টমার ম্যানেজমেন্ট সিস্টেম।",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

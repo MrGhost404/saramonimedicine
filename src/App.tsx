@@ -1,4 +1,4 @@
-import React, {useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {
   AlertTriangle,
   BarChart3,
@@ -22,7 +22,15 @@ import {SettingsView} from './components/SettingsView';
 import {WorkspaceView} from './components/WorkspaceView';
 import {usePharmacyStore} from './hooks/usePharmacyStore';
 import {formatNumber, t} from './i18n/translations';
-import type {ActiveTab, Sale} from './types/pharmacy';
+import {
+  createSaleAndDeductStock,
+  deleteMedicineFromFirestore,
+  fetchDailySalesFromFirestore,
+  fetchMedicinesFromFirestore,
+  saveMedicineToFirestore,
+  type DailySaleRecord,
+} from './service/pharmacyFirestore';
+import type {ActiveTab, Medicine, Sale, SaleItem} from './types/pharmacy';
 import {getMedicineAlertFlags} from './utils/alerts';
 
 export default function App() {
@@ -30,18 +38,129 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('workspace');
   const [activeInvoice, setActiveInvoice] = useState<Sale | null>(null);
 
+  // Firestore-এর জন্য অতিরিক্ত স্টেট
+  const [firestoreMedicines, setFirestoreMedicines] = useState<Medicine[] | null>(
+    null,
+  );
+  const [firestoreDailySales, setFirestoreDailySales] = useState<
+    DailySaleRecord[]
+  >([]);
+  const [isFirestoreLoading, setIsFirestoreLoading] = useState<boolean>(true);
+
   const lang = store.settings.language;
+
+  // Firestore থেকে ওষুধ ও আজকের ডেইলি সেলস লোড করা
+  const loadFirestoreData = useCallback(async () => {
+    setIsFirestoreLoading(true);
+    try {
+      const [meds, todaySales] = await Promise.all([
+        fetchMedicinesFromFirestore(),
+        fetchDailySalesFromFirestore(),
+      ]);
+      setFirestoreMedicines(meds);
+      setFirestoreDailySales(todaySales);
+    } catch (error) {
+      console.error('Failed to load Firestore data:', error);
+    } finally {
+      setIsFirestoreLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadFirestoreData();
+  }, [loadFirestoreData]);
+
+  // Firestore ডেটা পাওয়া গেলে সেটি প্রাধান্য পাবে, না থাকলে store-এর ডেটা ফলব্যাক হিসেবে থাকবে
+  const activeMedicines = useMemo(
+    () => (firestoreMedicines !== null ? firestoreMedicines : store.medicines),
+    [firestoreMedicines, store.medicines],
+  );
+
+  // ওষুধ সেভ বা আপডেট হ্যান্ডলার
+  const handleSaveMedicine = useCallback(
+    async (
+      medicine: Omit<Medicine, 'id' | 'updatedAt'> & {id?: string},
+    ): Promise<Medicine> => {
+      const updatedAt = new Date().toISOString();
+      const savedId = await saveMedicineToFirestore(
+        {...medicine, updatedAt} as Medicine,
+      );
+      const updatedMeds = await fetchMedicinesFromFirestore();
+      setFirestoreMedicines(updatedMeds);
+
+      const savedMedicine: Medicine = {
+        ...medicine,
+        id: savedId,
+        updatedAt,
+      };
+      if (typeof store.saveMedicine === 'function') {
+        await store.saveMedicine(savedMedicine);
+      }
+      return savedMedicine;
+    },
+    [store],
+  );
+
+  // 
+  // ওষুধ ডিলিট হ্যান্ডলার
+  const handleDeleteMedicine = useCallback(
+    async (medicineId: string) => {
+      await deleteMedicineFromFirestore(medicineId);
+      const updatedMeds = await fetchMedicinesFromFirestore();
+      setFirestoreMedicines(updatedMeds);
+
+      if (typeof store.removeMedicine === 'function') {
+        await store.removeMedicine(medicineId);
+      }
+    },
+    [store],
+  );
+
+  // বিক্রয় সাবমিট করে Firestore-এ সেলস সেভ ও স্টক আপডেট হ্যান্ডলার
+  const handleSubmitSale = useCallback(
+    async (salePayload: unknown) => {
+      const payload = (salePayload ?? {}) as Partial<Sale> & {
+        items?: SaleItem[];
+        totalAmount?: number;
+        total?: number;
+        invoiceNo?: string;
+      };
+
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      const totalAmount = Number(payload.totalAmount ?? payload.total ?? 0);
+
+      if (items.length > 0) {
+        await createSaleAndDeductStock({
+          items,
+          totalAmount,
+          invoiceNo: payload.invoiceNo,
+        });
+
+        const [updatedMeds, updatedSales] = await Promise.all([
+          fetchMedicinesFromFirestore(),
+          fetchDailySalesFromFirestore(),
+        ]);
+        setFirestoreMedicines(updatedMeds);
+        setFirestoreDailySales(updatedSales);
+      }
+
+      if (typeof store.submitSale === 'function') {
+        return await store.submitSale(salePayload as never);
+      }
+    },
+    [store],
+  );
 
   const alertCount = useMemo(() => {
     let count = 0;
-    for (const m of store.medicines) {
+    for (const m of activeMedicines) {
       const flags = getMedicineAlertFlags(m, store.settings.expiryAlertDays);
       if (flags.isExpired || flags.isExpiringSoon || flags.isLowStock) {
         count++;
       }
     }
     return count;
-  }, [store.medicines, store.settings.expiryAlertDays]);
+  }, [activeMedicines, store.settings.expiryAlertDays]);
 
   const navItems: Array<{
     id: ActiveTab;
@@ -66,6 +185,8 @@ export default function App() {
     lang === 'bn'
       ? store.settings.pharmacyName
       : store.settings.pharmacyNameEn;
+
+  const isAppLoading = store.isLoading && isFirestoreLoading;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -263,7 +384,7 @@ export default function App() {
                 <WifiOff className="h-3.5 w-3.5 shrink-0" />
                 <span>
                   {lang === 'bn'
-                    ? 'অফলাইন মোড সক্রিয় — সকল বিল ও ডাটা ডিভাইসে সেভ হচ্ছে এবং ইন্টারনেট ফিরলে অটো-সিঙ্ক হবে।'
+                    ? 'অফলাইন মোড সক্রিয় — সকল বিল ও ডাটা ডিভাইসে সেভ হচ্ছে এবং ইন্টারনেট ফিরলে অটো-সিঙ্ক হবে।'
                     : 'Offline Mode — Changes are saved locally and will auto-sync when online.'}
                 </span>
               </div>
@@ -278,7 +399,7 @@ export default function App() {
 
           {/* Main Viewport */}
           <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 pb-24 sm:px-6 lg:pb-8">
-            {store.isLoading ? (
+            {isAppLoading ? (
               <div className="space-y-4">
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   {[0, 1, 2, 3].map((i) => (
@@ -294,12 +415,12 @@ export default function App() {
               <>
                 {activeTab === 'workspace' && (
                   <WorkspaceView
-                    medicines={store.medicines}
+                    medicines={activeMedicines}
                     customers={store.customers}
                     sales={store.sales}
                     settings={store.settings}
                     lang={lang}
-                    onSubmitSale={store.submitSale}
+                    onSubmitSale={handleSubmitSale as never}
                     onQuickAddCustomer={store.saveCustomer}
                     onOpenInvoice={(sale) => setActiveInvoice(sale)}
                     onNavigateTab={(tab) => setActiveTab(tab)}
@@ -307,11 +428,11 @@ export default function App() {
                 )}
                 {activeTab === 'inventory' && (
                   <InventoryView
-                    medicines={store.medicines}
+                    medicines={activeMedicines}
                     settings={store.settings}
                     lang={lang}
-                    onSaveMedicine={store.saveMedicine}
-                    onDeleteMedicine={store.removeMedicine}
+                    onSaveMedicine={handleSaveMedicine}
+                    onDeleteMedicine={handleDeleteMedicine}
                   />
                 )}
                 {activeTab === 'customers' && (
@@ -337,16 +458,16 @@ export default function App() {
                 )}
                 {activeTab === 'alerts' && (
                   <AlertsView
-                    medicines={store.medicines}
+                    medicines={activeMedicines}
                     settings={store.settings}
                     lang={lang}
-                    onSaveMedicine={store.saveMedicine}
-                    onDeleteMedicine={store.removeMedicine}
+                    onSaveMedicine={handleSaveMedicine}
+                    onDeleteMedicine={handleDeleteMedicine}
                   />
                 )}
                 {activeTab === 'settings' && (
                   <SettingsView
-                    medicines={store.medicines}
+                    medicines={activeMedicines}
                     customers={store.customers}
                     sales={store.sales}
                     settings={store.settings}
